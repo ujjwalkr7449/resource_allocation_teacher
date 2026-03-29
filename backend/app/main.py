@@ -1,4 +1,8 @@
-from fastapi import Depends, FastAPI, HTTPException
+from datetime import date
+
+from fastapi import Depends, FastAPI, HTTPException, Query
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
@@ -14,6 +18,8 @@ from .database import Base, engine, get_db
 from .models import ResourceRequest, User
 from .schemas import (
     LoginInput,
+    ResourceAvailabilityItem,
+    ResourceAvailabilityOut,
     RegisterInput,
     RequestStatusUpdate,
     ResourceRequestCreate,
@@ -22,6 +28,32 @@ from .schemas import (
 )
 
 Base.metadata.create_all(bind=engine)
+
+
+def ensure_sqlite_columns() -> None:
+    if engine.dialect.name != "sqlite":
+        return
+
+    required_columns = {
+        "request_date": "DATE",
+        "start_time": "TIME",
+        "end_time": "TIME",
+    }
+    with engine.begin() as connection:
+        current_columns_raw = connection.execute(text("PRAGMA table_info(resource_requests)")).fetchall()
+        current_columns = {row[1] for row in current_columns_raw}
+        for column_name, column_type in required_columns.items():
+            if column_name in current_columns:
+                continue
+            try:
+                connection.execute(
+                    text(f"ALTER TABLE resource_requests ADD COLUMN {column_name} {column_type}")
+                )
+            except OperationalError:
+                continue
+
+
+ensure_sqlite_columns()
 
 app = FastAPI(title="Teacher Resource Allocation")
 
@@ -40,13 +72,15 @@ def serialize_request(item: ResourceRequest) -> ResourceRequestOut:
         class_name=item.class_name,
         room_number=item.room_number,
         periods_needed=item.periods_needed,
+        request_date=item.request_date,
+        start_time=item.start_time,
+        end_time=item.end_time,
         reason=item.reason,
         status=item.status,
         created_at=item.created_at,
         teacher_id=item.teacher_id,
         teacher_name=item.teacher.full_name,
     )
-
 
 @app.post("/auth/register", response_model=TokenResponse)
 def register(payload: RegisterInput, db: Session = Depends(get_db)):
@@ -90,6 +124,23 @@ def create_request(
     user: User = Depends(require_teacher),
     db: Session = Depends(get_db),
 ):
+    if payload.end_time <= payload.start_time:
+        raise HTTPException(status_code=400, detail="End time must be later than start time")
+
+    approved_conflict = (
+        db.query(ResourceRequest)
+        .filter(
+            ResourceRequest.room_number == payload.room_number,
+            ResourceRequest.request_date == payload.request_date,
+            ResourceRequest.status == "approved",
+            ResourceRequest.start_time < payload.end_time,
+            ResourceRequest.end_time > payload.start_time,
+        )
+        .first()
+    )
+    if approved_conflict is not None:
+        raise HTTPException(status_code=400, detail="Resource is already assigned for this time period")
+
     request = ResourceRequest(**payload.model_dump(), teacher_id=user.id)
     db.add(request)
     db.commit()
@@ -117,6 +168,58 @@ def list_all_requests(user: User = Depends(require_admin), db: Session = Depends
     return [serialize_request(item) for item in items]
 
 
+@app.get("/resources/schedule", response_model=list[ResourceAvailabilityOut])
+def resource_schedule(
+    request_date: date = Query(...),
+    room_number: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _ = user
+    query = db.query(ResourceRequest).filter(ResourceRequest.request_date == request_date)
+    if room_number:
+        clean_room = room_number.strip()
+        query = query.filter(ResourceRequest.room_number.ilike(f"%{clean_room}%"))
+    items = query.order_by(ResourceRequest.room_number.asc(), ResourceRequest.start_time.asc()).all()
+
+    grouped: dict[str, list[ResourceRequest]] = {}
+    for item in items:
+        grouped.setdefault(item.room_number, []).append(item)
+
+    response: list[ResourceAvailabilityOut] = []
+    for room, room_items in grouped.items():
+        bookings = [
+            ResourceAvailabilityItem(
+                room_number=room,
+                request_date=request_date,
+                start_time=entry.start_time,
+                end_time=entry.end_time,
+                status=entry.status,
+                teacher_name=entry.teacher.full_name,
+            )
+            for entry in room_items
+        ]
+        response.append(
+            ResourceAvailabilityOut(
+                room_number=room,
+                request_date=request_date,
+                is_available=not any(entry.status == "approved" for entry in room_items),
+                bookings=bookings,
+            )
+        )
+
+    if room_number and not response:
+        response.append(
+            ResourceAvailabilityOut(
+                room_number=room_number.strip(),
+                request_date=request_date,
+                is_available=True,
+                bookings=[],
+            )
+        )
+    return response
+
+
 @app.patch("/admin/requests/{request_id}", response_model=ResourceRequestOut)
 def update_request_status(
     request_id: int,
@@ -128,6 +231,25 @@ def update_request_status(
     request = db.query(ResourceRequest).filter(ResourceRequest.id == request_id).first()
     if request is None:
         raise HTTPException(status_code=404, detail="Request not found")
+
+    if payload.status == "approved":
+        approved_conflict = (
+            db.query(ResourceRequest)
+            .filter(
+                ResourceRequest.id != request.id,
+                ResourceRequest.room_number == request.room_number,
+                ResourceRequest.request_date == request.request_date,
+                ResourceRequest.status == "approved",
+                ResourceRequest.start_time < request.end_time,
+                ResourceRequest.end_time > request.start_time,
+            )
+            .first()
+        )
+        if approved_conflict is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot approve because this resource is already assigned for the same time period",
+            )
 
     request.status = payload.status
     db.commit()
