@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, time
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from sqlalchemy import text
@@ -172,10 +172,17 @@ def list_all_requests(user: User = Depends(require_admin), db: Session = Depends
 def resource_schedule(
     request_date: date = Query(...),
     room_number: str | None = Query(None),
+    start_time: time | None = Query(None),
+    end_time: time | None = Query(None),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     _ = user
+    if (start_time and not end_time) or (end_time and not start_time):
+        raise HTTPException(status_code=400, detail="Provide both start_time and end_time to filter by time slot")
+    if start_time and end_time and end_time <= start_time:
+        raise HTTPException(status_code=400, detail="end_time must be later than start_time")
+
     query = db.query(ResourceRequest).filter(ResourceRequest.request_date == request_date)
     if room_number:
         clean_room = room_number.strip()
@@ -188,6 +195,12 @@ def resource_schedule(
 
     response: list[ResourceAvailabilityOut] = []
     for room, room_items in grouped.items():
+        approved_overlap_exists = False
+        if start_time and end_time:
+            approved_overlap_exists = any(
+                entry.status == "approved" and entry.start_time < end_time and entry.end_time > start_time
+                for entry in room_items
+            )
         bookings = [
             ResourceAvailabilityItem(
                 room_number=room,
@@ -198,12 +211,15 @@ def resource_schedule(
                 teacher_name=entry.teacher.full_name,
             )
             for entry in room_items
+            if not start_time or (entry.start_time < end_time and entry.end_time > start_time)
         ]
         response.append(
             ResourceAvailabilityOut(
                 room_number=room,
                 request_date=request_date,
-                is_available=not any(entry.status == "approved" for entry in room_items),
+                is_available=not approved_overlap_exists
+                if start_time and end_time
+                else not any(entry.status == "approved" for entry in room_items),
                 bookings=bookings,
             )
         )

@@ -260,7 +260,7 @@ function AdminPanel({ session }) {
 }
 
 function ResourceSchedule({ session }) {
-  const [form, setForm] = useState({ request_date: '', room_number: '' })
+  const [form, setForm] = useState({ request_date: '', room_number: '', start_time: '', end_time: '' })
   const [items, setItems] = useState([])
   const [error, setError] = useState('')
 
@@ -270,6 +270,16 @@ function ResourceSchedule({ session }) {
       setError('')
       const params = new URLSearchParams({ request_date: form.request_date })
       if (form.room_number.trim()) params.set('room_number', form.room_number.trim())
+      if (form.start_time || form.end_time) {
+        if (!form.start_time || !form.end_time) {
+          throw new Error('Provide both start and end time to check slot availability')
+        }
+        if (form.end_time <= form.start_time) {
+          throw new Error('End time must be later than start time')
+        }
+        params.set('start_time', form.start_time)
+        params.set('end_time', form.end_time)
+      }
       const data = await api(`/resources/schedule?${params.toString()}`, 'GET', session.access_token)
       setItems(data)
     } catch (err) {
@@ -286,6 +296,10 @@ function ResourceSchedule({ session }) {
         <input type="date" value={form.request_date} onChange={(e) => setForm({ ...form, request_date: e.target.value })} required />
         <label>Room Number (optional)</label>
         <input value={form.room_number} onChange={(e) => setForm({ ...form, room_number: e.target.value })} placeholder="Search a specific room" />
+        <label>Start Time (optional)</label>
+        <input type="time" value={form.start_time} onChange={(e) => setForm({ ...form, start_time: e.target.value })} />
+        <label>End Time (optional)</label>
+        <input type="time" value={form.end_time} onChange={(e) => setForm({ ...form, end_time: e.target.value })} />
         <button type="submit">Check Availability</button>
       </form>
       {items.length > 0 && (
